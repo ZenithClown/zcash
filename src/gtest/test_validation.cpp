@@ -318,7 +318,7 @@ TEST(Validation, ContextualCheckInputsPassesWithTZE) {
     UpdateNetworkUpgradeParameters(Consensus::UPGRADE_BLOSSOM, 30);
     UpdateNetworkUpgradeParameters(Consensus::UPGRADE_HEARTWOOD, 40);
     UpdateNetworkUpgradeParameters(Consensus::UPGRADE_CANOPY, 50);
-    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_NEXT, 60);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_FUTURE, 60);
     auto consensusParams = Params(CBaseChainParams::REGTEST).GetConsensus();
 
     auto overwinterBranchId = NetworkUpgradeInfo[Consensus::UPGRADE_OVERWINTER].nBranchId;
@@ -326,7 +326,7 @@ TEST(Validation, ContextualCheckInputsPassesWithTZE) {
     auto blossomBranchId = NetworkUpgradeInfo[Consensus::UPGRADE_BLOSSOM].nBranchId;
     auto heartwoodBranchID = NetworkUpgradeInfo[Consensus::UPGRADE_HEARTWOOD].nBranchId;
     auto canopyBranchID = NetworkUpgradeInfo[Consensus::UPGRADE_CANOPY].nBranchId;
-    auto nextBranchID = NetworkUpgradeInfo[Consensus::UPGRADE_NEXT].nBranchId;
+    auto nextBranchID = NetworkUpgradeInfo[Consensus::UPGRADE_FUTURE].nBranchId;
 
     CBasicKeyStore keystore;
     CKey tsk = AddTestCKeyToKeyStore(keystore);
@@ -354,7 +354,7 @@ TEST(Validation, ContextualCheckInputsPassesWithTZE) {
         CCoinsViewCache view0(&fakeDB0);
 
         // Create a transparent transaction that spends the coin, targeting
-        // a height during the NU5 epoch
+        // a height during the FUTURE epoch
         auto builder = TransactionBuilder(consensusParams, 65, &keystore);
         builder.AddTransparentInput(utxo0, scriptPubKey, transparentValue0);
         CTxDestination dest = tsk.GetPubKey().GetID();
@@ -375,7 +375,7 @@ TEST(Validation, ContextualCheckInputsPassesWithTZE) {
         auto tx = builder.Build().GetTxOrThrow();
         ASSERT_FALSE(tx.IsCoinBase());
 
-        // Ensure that the inputs validate against NU5
+        // Ensure that the inputs validate against FUTURE
         CValidationState state;
         PrecomputedTransactionData txdata(tx);
         EXPECT_TRUE(ContextualCheckInputs(
