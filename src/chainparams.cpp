@@ -126,6 +126,9 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nProtocolVersion = 170013;
         consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_FUTURE].nProtocolVersion = 0x7FFFFFFF;
+        consensus.vUpgrades[Consensus::UPGRADE_FUTURE].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
         // The best chain should have at least this much work.
         consensus.nMinimumChainWork = uint256S("000000000000000000000000000000000000000000000000017e73a331fae01c");
@@ -332,6 +335,9 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nProtocolVersion = 170012;
         consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_FUTURE].nProtocolVersion = 0x7FFFFFFF;
+        consensus.vUpgrades[Consensus::UPGRADE_FUTURE].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
         // On testnet we activate this rule 6 blocks after Blossom activation. From block 299188 and
         // prior to Blossom activation, the testnet minimum-difficulty threshold was 15 minutes (i.e.
@@ -491,6 +497,9 @@ public:
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
         consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nProtocolVersion = 170012;
         consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_FUTURE].nProtocolVersion = 0x7FFFFFFF;
+        consensus.vUpgrades[Consensus::UPGRADE_FUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
         // The best chain should have at least this much work.

@@ -26,12 +26,20 @@
 #include "zcash/JoinSplit.hpp"
 #include "zcash/Proof.hpp"
 
+// Overwinter transaction version group id
+static constexpr uint32_t OVERWINTER_VERSION_GROUP_ID = 0x03C48270;
+static_assert(OVERWINTER_VERSION_GROUP_ID != 0, "version group id must be non-zero as specified in ZIP 202");
+
 // Overwinter transaction version
 static const int32_t OVERWINTER_TX_VERSION = 3;
 static_assert(OVERWINTER_TX_VERSION >= OVERWINTER_MIN_TX_VERSION,
     "Overwinter tx version must not be lower than minimum");
 static_assert(OVERWINTER_TX_VERSION <= OVERWINTER_MAX_TX_VERSION,
     "Overwinter tx version must not be higher than maximum");
+
+// Sapling transaction version group id
+static constexpr uint32_t SAPLING_VERSION_GROUP_ID = 0x892F2085;
+static_assert(SAPLING_VERSION_GROUP_ID != 0, "version group id must be non-zero as specified in ZIP 202");
 
 // Sapling transaction version
 static const int32_t SAPLING_TX_VERSION = 4;
@@ -40,8 +48,12 @@ static_assert(SAPLING_TX_VERSION >= SAPLING_MIN_TX_VERSION,
 static_assert(SAPLING_TX_VERSION <= SAPLING_MAX_TX_VERSION,
     "Sapling tx version must not be higher than maximum");
 
+// Future transaction version group id
+static constexpr uint32_t FUTURE_VERSION_GROUP_ID = 0xFFFFFFFF;
+static_assert(FUTURE_VERSION_GROUP_ID != 0, "version group id must be non-zero as specified in ZIP 202");
+
 // Not-yet-active transaction version.
-static const int32_t FUTURE_TX_VERSION = 999999;
+static const int32_t FUTURE_TX_VERSION = 0xFFFFFFFF;
 
 struct TxVersionInfo {
     bool fOverwintered;
@@ -636,18 +648,6 @@ public:
     std::string ToString() const;
 };
 
-
-// Overwinter transaction version group id
-static constexpr uint32_t OVERWINTER_VERSION_GROUP_ID = 0x03C48270;
-static_assert(OVERWINTER_VERSION_GROUP_ID != 0, "version group id must be non-zero as specified in ZIP 202");
-
-// Sapling transaction version group id
-static constexpr uint32_t SAPLING_VERSION_GROUP_ID = 0x892F2085;
-static_assert(SAPLING_VERSION_GROUP_ID != 0, "version group id must be non-zero as specified in ZIP 202");
-
-// Future transaction version group id
-static constexpr uint32_t FUTURE_VERSION_GROUP_ID = 0x83252789;
-static_assert(FUTURE_VERSION_GROUP_ID != 0, "version group id must be non-zero as specified in ZIP 202");
 
 struct CMutableTransaction;
 
