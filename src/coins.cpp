@@ -12,36 +12,32 @@
 #include <assert.h>
 
 /**
- * calculate number of bytes for the bitmask, and its number of non-zero bytes
- * each bit in the bitmask represents the availability of one output, but the
- * availabilities of the first two outputs are encoded separately
+ * If the vout at the specified position is non-null, set
+ * it to null then remove null entries from the list of vouts.
  */
-void CCoins::CalcMaskSize(unsigned int &nBytes, unsigned int &nNonzeroBytes) const {
-    unsigned int nLastUsedByte = 0;
-    for (unsigned int b = 0; 2+b*8 < vout.size(); b++) {
-        bool fZero = true;
-        for (unsigned int i = 0; i < 8 && 2+b*8+i < vout.size(); i++) {
-            if (!vout[2+b*8+i].IsNull()) {
-                fZero = false;
-                continue;
-            }
-        }
-        if (!fZero) {
-            nLastUsedByte = b + 1;
-            nNonzeroBytes++;
-        }
-    }
-    nBytes += nLastUsedByte;
-}
-
-bool CCoins::Spend(uint32_t nPos) 
+bool CCoins::Spend(uint32_t nPos)
 {
+    // Why the .IsNull() check here? This stops us from running
+    // the Cleanup() call
     if (nPos >= vout.size() || vout[nPos].IsNull())
         return false;
     vout[nPos].SetNull();
     Cleanup();
+
     return true;
 }
+
+bool CCoins::SpendTzeOut(uint32_t nPos)
+{
+    if (nPos >= vtzeout.size() || vtzeout[nPos].second == SPENT) {
+        return false;
+    } else {
+        vtzeout[nPos].second = SPENT;
+        return true;
+    }
+}
+
+
 bool CCoinsView::GetSproutAnchorAt(const uint256 &rt, SproutMerkleTree &tree) const { return false; }
 bool CCoinsView::GetSaplingAnchorAt(const uint256 &rt, SaplingMerkleTree &tree) const { return false; }
 bool CCoinsView::GetNullifier(const uint256 &nullifier, ShieldedType type) const { return false; }
@@ -483,7 +479,7 @@ void CCoinsViewCache::PushHistoryNode(uint32_t epochId, const HistoryNode node) 
     std::array<HistoryNode, 32> appendBuf = {};
 
     uint32_t appends = librustzcash_mmr_append(
-        epochId, 
+        epochId,
         historyCache.length,
         entry_indices.data(),
         entries.data(),
@@ -516,7 +512,7 @@ void CCoinsViewCache::PopHistoryNode(uint32_t epochId) {
             // `SelectHistoryCache` selects the tree for the new consensus
             // branch ID, not the one that existed on the chain being rolled
             // back.
-            
+
             // Sensible action is to truncate the history cache:
         }
         case 1:
@@ -698,7 +694,8 @@ bool CCoinsViewCache::HaveCoins(const uint256 &txid) const {
     // as we only care about the case where a transaction was replaced entirely
     // in a reorganization (which wipes vout entirely, as opposed to spending
     // which just cleans individual outputs).
-    return (it != cacheCoins.end() && !it->second.coins.vout.empty());
+    return (it != cacheCoins.end() &&
+            !(it->second.coins.vout.empty() && it->second.coins.vtzeout.empty()));
 }
 
 uint256 CCoinsViewCache::GetBestBlock() const {
@@ -900,6 +897,13 @@ const CTxOut &CCoinsViewCache::GetOutputFor(const CTxIn& input) const
     return coins->vout[input.prevout.n];
 }
 
+const CTzeOut &CCoinsViewCache::GetTzeOutFor(const CTzeIn& input) const
+{
+    const CCoins* coins = AccessCoins(input.prevout.hash);
+    assert(coins && coins->IsTzeAvailable(input.prevout.n));
+    return coins->vtzeout[input.prevout.n].first;
+}
+
 CAmount CCoinsViewCache::GetValueIn(const CTransaction& tx) const
 {
     if (tx.IsCoinBase())
@@ -908,6 +912,9 @@ CAmount CCoinsViewCache::GetValueIn(const CTransaction& tx) const
     CAmount nResult = 0;
     for (unsigned int i = 0; i < tx.vin.size(); i++)
         nResult += GetOutputFor(tx.vin[i]).nValue;
+
+    for (unsigned int i = 0; i < tx.vtzein.size(); i++)
+        nResult += GetTzeOutFor(tx.vtzein[i]).nValue;
 
     nResult += tx.GetShieldedValueIn();
 
@@ -968,6 +975,14 @@ bool CCoinsViewCache::HaveInputs(const CTransaction& tx) const
                 return false;
             }
         }
+
+        for (unsigned int i = 0; i < tx.vtzein.size(); i++) {
+            const COutPoint &prevout = tx.vtzein[i].prevout;
+            const CCoins* coins = AccessCoins(prevout.hash);
+            if (!coins || !coins->IsTzeAvailable(prevout.n)) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -997,6 +1012,8 @@ double CCoinsViewCache::GetPriority(const CTransaction &tx, int nHeight) const
             dResult += coins->vout[txin.prevout.n].nValue * (nHeight-coins->nHeight);
         }
     }
+
+    // TZE: priority code is being removed concurrently, so not updating here.
 
     return tx.ComputePriority(dResult);
 }

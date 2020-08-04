@@ -27,6 +27,7 @@
 #include "net.h"
 #include "policy/policy.h"
 #include "pow.h"
+#include "tze.h"
 #include "txmempool.h"
 #include "ui_interface.h"
 #include "undo.h"
@@ -619,6 +620,9 @@ bool AddOrphanTx(const CTransaction& tx, NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(c
     BOOST_FOREACH(const CTxIn& txin, tx.vin)
         mapOrphanTransactionsByPrev[txin.prevout.hash].insert(hash);
 
+    BOOST_FOREACH(const CTzeIn& tzein, tx.vtzein)
+        mapOrphanTransactionsByPrev[tzein.prevout.hash].insert(hash);
+
     LogPrint("mempool", "stored orphan tx %s (mapsz %u prevsz %u)\n", hash.ToString(),
              mapOrphanTransactions.size(), mapOrphanTransactionsByPrev.size());
     return true;
@@ -632,6 +636,15 @@ void static EraseOrphanTx(uint256 hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     BOOST_FOREACH(const CTxIn& txin, it->second.tx.vin)
     {
         map<uint256, set<uint256> >::iterator itPrev = mapOrphanTransactionsByPrev.find(txin.prevout.hash);
+        if (itPrev == mapOrphanTransactionsByPrev.end())
+            continue;
+        itPrev->second.erase(hash);
+        if (itPrev->second.empty())
+            mapOrphanTransactionsByPrev.erase(itPrev);
+    }
+    BOOST_FOREACH(const CTzeIn& tzein, it->second.tx.vtzein)
+    {
+        map<uint256, set<uint256> >::iterator itPrev = mapOrphanTransactionsByPrev.find(tzein.prevout.hash);
         if (itPrev == mapOrphanTransactionsByPrev.end())
             continue;
         itPrev->second.erase(hash);
@@ -761,7 +774,7 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& in
 
 /**
  * Check a transaction contextually against a set of consensus rules valid at a given block height.
- * 
+ *
  * Notes:
  * 1. AcceptToMemoryPool calls CheckTransaction and this function.
  * 2. ProcessNewBlock calls AcceptBlock, which calls CheckBlock (which calls CheckTransaction)
@@ -790,11 +803,15 @@ bool ContextualCheckTransaction(
     auto dosLevelPotentiallyRelaxing = isMined ? DOS_LEVEL_BLOCK : (
         isInitBlockDownload(chainparams) ? 0 : DOS_LEVEL_MEMPOOL);
 
-    bool overwinterActive = chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_OVERWINTER);
-    bool saplingActive = chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_SAPLING);
+    auto consensus = chainparams.GetConsensus();
+
+    bool overwinterActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_OVERWINTER);
     bool isSprout = !overwinterActive;
-    bool heartwoodActive = chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_HEARTWOOD);
-    bool canopyActive = chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY);
+
+    bool saplingActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_SAPLING);
+    bool heartwoodActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_HEARTWOOD);
+    bool canopyActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY);
+    bool futureActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_FUTURE);
 
     // If Sprout rules apply, reject transactions which are intended for Overwinter and beyond
     if (isSprout && tx.fOverwintered) {
@@ -804,7 +821,23 @@ bool ContextualCheckTransaction(
             REJECT_INVALID, "tx-overwinter-not-active");
     }
 
-    if (saplingActive) {
+    if (futureActive) {
+        // Reject transactions with non-Sapling version group ID
+        if (tx.fOverwintered && tx.nVersionGroupId != FUTURE_VERSION_GROUP_ID) {
+            return state.DoS(
+                dosLevelPotentiallyRelaxing,
+                error("CheckTransaction(): invalid future tx group version"),
+                REJECT_INVALID, "bad-future-tx-version-group-id");
+        }
+
+        // Reject transactions with invalid version
+        if (tx.fOverwintered && tx.nVersion <= SAPLING_MAX_TX_VERSION ) {
+            return state.DoS(
+                dosLevelConstricting,
+                error("CheckTransaction(): Transaction version too low. You must choose something greater than SAPLING_MAX_TX_VERSION"),
+                REJECT_INVALID, "bad-tx-future-version-too-low");
+        }
+    } else if (saplingActive) {
         // Reject transactions with valid version but missing overwintered flag
         if (tx.nVersion >= SAPLING_MIN_TX_VERSION && !tx.fOverwintered) {
             return state.DoS(
@@ -871,7 +904,7 @@ bool ContextualCheckTransaction(
                 error("ContextualCheckTransaction: overwinter is active"),
                 REJECT_INVALID, "tx-overwinter-active");
         }
-    
+
         // Check that all transactions are unexpired
         if (IsExpiredTx(tx, nHeight)) {
             // Don't increase banscore if the transaction only just expired
@@ -1006,8 +1039,8 @@ bool ContextualCheckTransaction(
         }
     }
 
-    auto consensusBranchId = CurrentEpochBranchId(nHeight, chainparams.GetConsensus());
-    auto prevConsensusBranchId = PrevEpochBranchId(consensusBranchId, chainparams.GetConsensus());
+    auto consensusBranchId = CurrentEpochBranchId(nHeight, consensus);
+    auto prevConsensusBranchId = PrevEpochBranchId(consensusBranchId, consensus);
     uint256 dataToBeSigned;
     uint256 prevDataToBeSigned;
 
@@ -1159,10 +1192,17 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state,
     }
 }
 
+/**
+ * Basic checks that don't depend on any context.
+ *
+ * This function must obey the following contract: it must reject transactions
+ * that are invalid according to the transaction's embedded version
+ * information, but it may accept transactions that are valid with respect to
+ * embedded version information but are invalid with respect to current
+ * consensus rules.
+ */
 bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidationState &state)
 {
-    // Basic checks that don't depend on any context
-
     /**
      * Previously:
      * 1. The consensus rule below was:
@@ -1206,13 +1246,14 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
     }
 
     // Transactions containing empty `vin` must have either non-empty
-    // `vJoinSplit` or non-empty `vShieldedSpend`.
-    if (tx.vin.empty() && tx.vJoinSplit.empty() && tx.vShieldedSpend.empty())
+    // `vJoinSplit` or non-empty `vShieldedSpend` or non-empty `tzein`.
+    if (tx.vin.empty() && tx.vJoinSplit.empty() && tx.vShieldedSpend.empty() && tx.vtzein.empty())
         return state.DoS(10, error("CheckTransaction(): vin empty"),
                          REJECT_INVALID, "bad-txns-vin-empty");
+
     // Transactions containing empty `vout` must have either non-empty
-    // `vJoinSplit` or non-empty `vShieldedOutput`.
-    if (tx.vout.empty() && tx.vJoinSplit.empty() && tx.vShieldedOutput.empty())
+    // `vJoinSplit` or non-empty `vShieldedOutput` or non-empty `tzeout`.
+    if (tx.vout.empty() && tx.vJoinSplit.empty() && tx.vShieldedOutput.empty() && tx.vtzeout.empty())
         return state.DoS(10, error("CheckTransaction(): vout empty"),
                          REJECT_INVALID, "bad-txns-vout-empty");
 
@@ -1234,10 +1275,27 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             return state.DoS(100, error("CheckTransaction(): txout.nValue too high"),
                              REJECT_INVALID, "bad-txns-vout-toolarge");
         nValueOut += txout.nValue;
-        if (!MoneyRange(nValueOut))
-            return state.DoS(100, error("CheckTransaction(): txout total out of range"),
-                             REJECT_INVALID, "bad-txns-txouttotal-toolarge");
     }
+
+    // Check for negative or overflow TZE output values
+    //
+    // In the case that the TZE extension is not enabled, this check
+    // is still valid, according to the false-positive semantics of this
+    // function.
+    BOOST_FOREACH(const CTzeOut& tzeout, tx.vtzeout)
+    {
+        if (tzeout.nValue < 0)
+            return state.DoS(100, error("CheckTransaction(): tzeout.nValue negative"),
+                             REJECT_INVALID, "bad-txns-vout-negative");
+        if (tzeout.nValue > MAX_MONEY)
+            return state.DoS(100, error("CheckTransaction(): tzeout.nValue too high"),
+                             REJECT_INVALID, "bad-txns-vout-toolarge");
+        nValueOut += tzeout.nValue;
+    }
+
+    if (!MoneyRange(nValueOut))
+        return state.DoS(100, error("CheckTransaction(): transparent total out of range"),
+                         REJECT_INVALID, "bad-txns-txouttotal-toolarge");
 
     // Check for non-zero valueBalance when there are no Sapling inputs or outputs
     if (tx.vShieldedSpend.empty() && tx.vShieldedOutput.empty() && tx.valueBalance != 0) {
@@ -1334,6 +1392,16 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
         vInOutPoints.insert(txin.prevout);
     }
 
+    // Check for duplicate TZE inputs
+    set<COutPoint> vTzeInOutPoints;
+    BOOST_FOREACH(const CTzeIn& tzein, tx.vtzein)
+    {
+        if (vTzeInOutPoints.count(tzein.prevout))
+            return state.DoS(100, error("CheckTransaction(): duplicate TZE inputs"),
+                             REJECT_INVALID, "bad-txns-inputs-duplicate");
+        vTzeInOutPoints.insert(tzein.prevout);
+    }
+
     // Check for duplicate joinsplit nullifiers in this transaction
     {
         set<uint256> vJoinSplitNullifiers;
@@ -1376,6 +1444,11 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
                              REJECT_INVALID, "bad-cb-has-spend-description");
         // See ContextualCheckTransaction for consensus rules on coinbase output descriptions.
 
+        // A coinbase transaction cannot have TZE inputs
+        if (tx.vtzein.size() > 0)
+            return state.DoS(100, error("CheckTransaction(): coinbase has TZE inputs"),
+                             REJECT_INVALID, "bad-cb-has-tze-inputs");
+
         if (tx.vin[0].scriptSig.size() < 2 || tx.vin[0].scriptSig.size() > 100)
             return state.DoS(100, error("CheckTransaction(): coinbase script size"),
                              REJECT_INVALID, "bad-cb-length");
@@ -1384,7 +1457,12 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
     {
         BOOST_FOREACH(const CTxIn& txin, tx.vin)
             if (txin.prevout.IsNull())
-                return state.DoS(10, error("CheckTransaction(): prevout is null"),
+                return state.DoS(10, error("CheckTransaction(): transparent input prevout is null"),
+                                 REJECT_INVALID, "bad-txns-prevout-null");
+
+        BOOST_FOREACH(const CTzeIn& tzein, tx.vtzein)
+            if (tzein.prevout.IsNull())
+                return state.DoS(10, error("CheckTransaction(): TZE input prevout is null"),
                                  REJECT_INVALID, "bad-txns-prevout-null");
     }
 
@@ -1421,7 +1499,7 @@ CAmount GetMinRelayFee(const CTransaction& tx, unsigned int nBytes, bool fAllowF
 }
 
 
-bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree,
+bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const TZE& tze, const CTransaction &tx, bool fLimitFree,
                         bool* pfMissingInputs, bool fRejectAbsurdFee)
 {
     AssertLockHeld(cs_main);
@@ -1477,18 +1555,27 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
     if (pool.exists(hash))
         return false;
 
-    // Check for conflicts with in-memory transactions
+    // Check for conflicts with in-memory transactions (situations where
+    // the mempool already contains transactions that spend the same inputs.)
     {
     LOCK(pool.cs); // protect pool.mapNextTx
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
         COutPoint outpoint = tx.vin[i].prevout;
-        if (pool.mapNextTx.count(outpoint))
-        {
-            // Disable replacement feature for now
+        if (pool.spendingTxExists(outpoint)) {
+            // Disable replacement feature for now (replace-by-fee)
             return false;
         }
     }
+
+    for (unsigned int i = 0; i < tx.vtzein.size(); i++)
+    {
+        COutPoint outpoint = tx.vtzein[i].prevout;
+        if (pool.spendingTzeTxExists(outpoint)) {
+            return false;
+        }
+    }
+
     BOOST_FOREACH(const JSDescription &joinsplit, tx.vJoinSplit) {
         BOOST_FOREACH(const uint256 &nf, joinsplit.nullifiers) {
             if (pool.nullifierExists(nf, SPROUT)) {
@@ -1514,14 +1601,23 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         view.SetBackend(viewMemPool);
 
         // do we already have it?
-        if (view.HaveCoins(hash))
+        if (view.HaveCoins(hash)) {
             return false;
+        }
 
         // do all inputs exist?
         // Note that this does not check for the presence of actual outputs (see the next check for that),
         // and only helps with filling in pfMissingInputs (to determine missing vs spent).
         BOOST_FOREACH(const CTxIn txin, tx.vin) {
             if (!view.HaveCoins(txin.prevout.hash)) {
+                if (pfMissingInputs)
+                    *pfMissingInputs = true;
+                return false;
+            }
+        }
+
+        BOOST_FOREACH(const CTzeIn tzein, tx.vtzein) {
+            if (!view.HaveCoins(tzein.prevout.hash)) {
                 if (pfMissingInputs)
                     *pfMissingInputs = true;
                 return false;
@@ -1637,7 +1733,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         // Check against previous transactions
         // This is done last to help prevent CPU exhaustion denial-of-service attacks.
         PrecomputedTransactionData txdata(tx);
-        if (!ContextualCheckInputs(tx, state, view, true, STANDARD_SCRIPT_VERIFY_FLAGS, true, txdata, Params().GetConsensus(), consensusBranchId))
+        if (!ContextualCheckInputs(tze, tx, state, view, true, STANDARD_SCRIPT_VERIFY_FLAGS, true, txdata, Params().GetConsensus(), consensusBranchId, nextBlockHeight))
         {
             return error("AcceptToMemoryPool: ConnectInputs failed %s", hash.ToString());
         }
@@ -1651,7 +1747,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         // There is a similar check in CreateNewBlock() to prevent creating
         // invalid blocks, however allowing such transactions into the mempool
         // can be exploited as a DoS attack.
-        if (!ContextualCheckInputs(tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS, true, txdata, Params().GetConsensus(), consensusBranchId))
+        if (!ContextualCheckInputs(tze, tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS, true, txdata, Params().GetConsensus(), consensusBranchId, nextBlockHeight))
         {
             return error("AcceptToMemoryPool: BUG! PLEASE REPORT THIS! ConnectInputs failed against MANDATORY but not STANDARD flags %s", hash.ToString());
         }
@@ -1659,7 +1755,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         {
             // We lock to prevent other threads from accessing the mempool between adding and evicting
             LOCK(pool.cs);
-            
+
             // Store transaction in memory
             pool.addUnchecked(hash, entry, !IsInitialBlockDownload(Params()));
 
@@ -2117,8 +2213,8 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
             CCoinsModifier coins = inputs.ModifyCoins(txin.prevout.hash);
             unsigned nPos = txin.prevout.n;
 
-            if (nPos >= coins->vout.size() || coins->vout[nPos].IsNull())
-                assert(false);
+            assert(nPos < coins->vout.size() && !coins->vout[nPos].IsNull());
+
             // mark an outpoint spent, and construct undo information
             txundo.vprevout.push_back(CTxInUndo(coins->vout[nPos]));
             coins->Spend(nPos);
@@ -2128,6 +2224,14 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
                 undo.fCoinBase = coins->fCoinBase;
                 undo.nVersion = coins->nVersion;
             }
+        }
+
+        BOOST_FOREACH(const CTzeIn &tzein, tx.vtzein) {
+            CCoinsModifier coins = inputs.ModifyCoins(tzein.prevout.hash);
+            unsigned nPos = tzein.prevout.n;
+            coins->SpendTzeOut(nPos);
+
+            // TZE: Do we need a repr of undo information?
         }
     }
 
@@ -2206,11 +2310,26 @@ bool CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoins
 
         }
 
+        // nValueIn for a transaction must include TZE inputs.
+        for (unsigned int i = 0; i < tx.vtzein.size(); i++)
+        {
+            const COutPoint &prevout = tx.vtzein[i].prevout;
+            const CCoins *pCoins = inputs.AccessCoins(prevout.hash);
+            assert(pCoins && pCoins->vtzeout.size() > prevout.n);
+
+            // should this check spentness?
+            nValueIn += pCoins->vtzeout[prevout.n].first.nValue;
+            if (!MoneyRange(pCoins->vtzeout[prevout.n].first.nValue) || !MoneyRange(nValueIn))
+                return state.DoS(100, error("CheckInputs(): tzein amount out of range"),
+                                 REJECT_INVALID, "bad-txns-inputvalues-outofrange");
+        }
+
         nValueIn += tx.GetShieldedValueIn();
         if (!MoneyRange(nValueIn))
             return state.DoS(100, error("CheckInputs(): shielded input to transparent value pool out of range"),
                              REJECT_INVALID, "bad-txns-inputvalues-outofrange");
 
+        // This is the vital check to ensure that value is not claimed to be created from nowhere.
         if (nValueIn < tx.GetValueOut())
             return state.DoS(100, error("CheckInputs(): %s value in (%s) < value out (%s)",
                                         tx.GetHash().ToString(), FormatMoney(nValueIn), FormatMoney(tx.GetValueOut())),
@@ -2230,15 +2349,17 @@ bool CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoins
 }// namespace Consensus
 
 bool ContextualCheckInputs(
+    const TZE& tze,
     const CTransaction& tx,
     CValidationState &state,
-    const CCoinsViewCache &inputs,
+    const CCoinsViewCache &inputs, //chain view state as of a particular height (CChainStateView)
     bool fScriptChecks,
     unsigned int flags,
     bool cacheStore,
     PrecomputedTransactionData& txdata,
     const Consensus::Params& consensusParams,
     uint32_t consensusBranchId,
+    int32_t nHeight,
     std::vector<CScriptCheck> *pvChecks)
 {
     if (!tx.IsCoinBase())
@@ -2260,11 +2381,11 @@ bool ContextualCheckInputs(
         if (fScriptChecks) {
             for (unsigned int i = 0; i < tx.vin.size(); i++) {
                 const COutPoint &prevout = tx.vin[i].prevout;
-                const CCoins* coins = inputs.AccessCoins(prevout.hash);
-                assert(coins);
+                const CCoins* pCoins = inputs.AccessCoins(prevout.hash);
+                assert(pCoins);
 
                 // Verify signature
-                CScriptCheck check(*coins, tx, i, flags, cacheStore, consensusBranchId, &txdata);
+                CScriptCheck check(*pCoins, tx, i, flags, cacheStore, consensusBranchId, &txdata);
                 if (pvChecks) {
                     pvChecks->push_back(CScriptCheck());
                     check.swap(pvChecks->back());
@@ -2277,7 +2398,7 @@ bool ContextualCheckInputs(
                     // notice their transactions failing before a second network
                     // upgrade occurs.
                     auto prevConsensusBranchId = PrevEpochBranchId(consensusBranchId, consensusParams);
-                    CScriptCheck checkPrev(*coins, tx, i, flags, cacheStore, prevConsensusBranchId, &txdata);
+                    CScriptCheck checkPrev(*pCoins, tx, i, flags, cacheStore, prevConsensusBranchId, &txdata);
                     if (checkPrev()) {
                         return state.DoS(
                             10, false, REJECT_INVALID, strprintf(
@@ -2292,7 +2413,7 @@ bool ContextualCheckInputs(
                         // arguments; if so, don't trigger DoS protection to
                         // avoid splitting the network between upgraded and
                         // non-upgraded nodes.
-                        CScriptCheck check2(*coins, tx, i,
+                        CScriptCheck check2(*pCoins, tx, i,
                                 flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheStore, consensusBranchId, &txdata);
                         if (check2())
                             return state.Invalid(false, REJECT_NONSTANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
@@ -2301,6 +2422,45 @@ bool ContextualCheckInputs(
                     // invalid in new blocks, e.g. a invalid P2SH. We DoS ban
                     // such nodes as they are not following the protocol.
                     return state.DoS(100,false, REJECT_INVALID, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError())));
+                }
+            }
+
+            if (consensusParams.FeatureActive(nHeight, Consensus::ZIP222_TZE)) {
+                // for each TZE input, look up the associated prior TZE output, and pass both
+                // to the extension checker.
+                for (unsigned int i = 0; i < tx.vtzein.size(); i++) {
+                    const COutPoint& prevout = tx.vtzein[i].prevout;
+                    const CCoins* pCoins = inputs.AccessCoins(prevout.hash);
+                    assert(pCoins && pCoins->vtzeout.size() > prevout.n);
+
+                    // Check that the witness has the same tze type and mode as the
+                    // predicate. This might be duplicative of a check within the
+                    // TZE code itself?
+                    const CTzeData& witness = tx.vtzein[i].witness;
+                    const CTzeData& predicate = pCoins->vtzeout[prevout.n].first.predicate;
+                    if (witness.corresponds(predicate)) {
+                        // construct the context
+                        TzeContext ctx(nHeight, tx);
+
+                        // call through to the rust API's verify function
+                        if (!tze.check(consensusBranchId, predicate, witness, ctx)) {
+                            // FIXME: Need proper levels
+                            return state.DoS(10, false, REJECT_INVALID, "tze check failed");
+                        }
+                    } else {
+                        // FIXME: Placeholder, what should the actual rejection be?
+                        return state.DoS(100, false, REJECT_INVALID, "tze id or mode mismatch");
+                    }
+                }
+            } else {
+                // Consensus rules must reject TZE-relevant data in transactions if the TZE
+                // feature is not enabled
+                if (tx.vtzein.size() > 0) {
+                    return state.DoS(100, false, REJECT_INVALID, "TZE inputs present, but TZE-mode is not enabled.");
+                }
+
+                if (tx.vtzeout.size() > 0) {
+                    return state.DoS(100, false, REJECT_INVALID, "TZE outputs present, but TZE-mode is not enabled");
                 }
             }
         }
@@ -2889,7 +3049,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
             std::vector<CScriptCheck> vChecks;
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
-            if (!ContextualCheckInputs(tx, state, view, fExpensiveChecks, flags, fCacheResults, txdata[i], chainparams.GetConsensus(), consensusBranchId, nScriptCheckThreads ? &vChecks : NULL))
+            if (!ContextualCheckInputs(chainparams.GetTzeCapability(), tx, state, view, fExpensiveChecks, flags, fCacheResults, txdata[i], chainparams.GetConsensus(), consensusBranchId, pindex->nHeight, nScriptCheckThreads ? &vChecks : NULL))
                 return false;
             control.Add(vChecks);
         }
@@ -3277,7 +3437,8 @@ bool static DisconnectTip(CValidationState &state, const CChainParams& chainpara
             // ignore validation errors in resurrected transactions
             list<CTransaction> removed;
             CValidationState stateDummy;
-            if (tx.IsCoinBase() || !AcceptToMemoryPool(mempool, stateDummy, tx, false, NULL))
+            if (tx.IsCoinBase() || !AcceptToMemoryPool(mempool, stateDummy, chainparams.GetTzeCapability(),
+                                                       tx, false, NULL))
                 mempool.remove(tx, removed, true);
         }
         if (sproutAnchorBeforeDisconnect != sproutAnchorAfterDisconnect) {
@@ -5024,7 +5185,7 @@ bool LoadBlockIndex()
     return true;
 }
 
-bool InitBlockIndex(const CChainParams& chainparams) 
+bool InitBlockIndex(const CChainParams& chainparams)
 {
     LOCK(cs_main);
 
@@ -6001,7 +6162,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         pfrom->setAskFor.erase(inv.hash);
         mapAlreadyAskedFor.erase(inv);
 
-        if (!AlreadyHave(inv) && AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs))
+        if (!AlreadyHave(inv) && AcceptToMemoryPool(mempool, state, chainparams.GetTzeCapability(), tx, true, &fMissingInputs))
         {
             mempool.check(pcoinsTip);
             RelayTransaction(tx);
@@ -6035,7 +6196,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
                     if (setMisbehaving.count(fromPeer))
                         continue;
-                    if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2))
+                    if (AcceptToMemoryPool(mempool, stateDummy, chainparams.GetTzeCapability(), orphanTx, true, &fMissingInputs2))
                     {
                         LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
                         RelayTransaction(orphanTx);
@@ -6879,17 +7040,13 @@ public:
 CMutableTransaction CreateNewContextualCMutableTransaction(const Consensus::Params& consensusParams, int nHeight)
 {
     CMutableTransaction mtx;
-    bool isOverwintered = consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_OVERWINTER);
-    if (isOverwintered) {
-        mtx.fOverwintered = true;
-        if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_SAPLING)) {
-            mtx.nVersionGroupId = SAPLING_VERSION_GROUP_ID;
-            mtx.nVersion = SAPLING_TX_VERSION;
-        } else {
-            mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
-            mtx.nVersion = OVERWINTER_TX_VERSION;
-        }
-        
+
+    auto txVersionInfo = CurrentTxVersionInfo(consensusParams, nHeight);
+    mtx.fOverwintered   = txVersionInfo.fOverwintered;
+    mtx.nVersionGroupId = txVersionInfo.nVersionGroupId;
+    mtx.nVersion        = txVersionInfo.nVersion;
+
+    if (txVersionInfo.fOverwintered) {
         bool blossomActive = consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_BLOSSOM);
         unsigned int defaultExpiryDelta = blossomActive ? DEFAULT_POST_BLOSSOM_TX_EXPIRY_DELTA : DEFAULT_PRE_BLOSSOM_TX_EXPIRY_DELTA;
         mtx.nExpiryHeight = nHeight + (expiryDeltaArg ? expiryDeltaArg.get() : defaultExpiryDelta);
@@ -6907,5 +7064,6 @@ CMutableTransaction CreateNewContextualCMutableTransaction(const Consensus::Para
             mtx.nExpiryHeight = std::min(mtx.nExpiryHeight, static_cast<uint32_t>(nextActivationHeight.get()) - 1);
         }
     }
+
     return mtx;
 }

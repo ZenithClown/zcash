@@ -11,7 +11,9 @@
 #include "key_constants.h"
 #include <zcash/address/sapling.hpp>
 
+#include <boost/foreach.hpp>
 #include <boost/optional.hpp>
+#include <set>
 
 namespace Consensus {
 
@@ -35,6 +37,7 @@ enum UpgradeIndex : uint32_t {
     UPGRADE_BLOSSOM,
     UPGRADE_HEARTWOOD,
     UPGRADE_CANOPY,
+    UPGRADE_FUTURE,
     // NOTE: Also add new upgrades to NetworkUpgradeInfo in upgrades.cpp
     MAX_NETWORK_UPGRADES
 };
@@ -80,6 +83,35 @@ struct NetworkUpgrade {
      */
     boost::optional<uint256> hashActivationBlock;
 };
+
+enum ConsensusFeature : uint32_t {
+    ZIP222_TZE,
+    // Index value for the maximum consensus feature ID.
+    MAX_FEATURES
+};
+
+struct FeatureInfo {
+    std::vector<ConsensusFeature> dependencies;
+};
+
+/**
+ * FeatureDeps encodes a directed acyclic graph of feature dependencies
+ * as an array indexed by feature ID. Values are FeatureInfo objects
+ * containing the list of feature IDs upon which the index's feature ID
+ * depends.
+ *
+ * When we go to use this, what we usually need is to invert this index,
+ * to make it possible to determine whether an feature is enabled due
+ * to a transitive relationship with a manually-enabled feature.
+ */
+const struct FeatureInfo FeatureDeps[ConsensusFeature::MAX_FEATURES] = {
+    {
+        /* ZIP222_TZE */
+        /* dependencies = */ {}
+    }
+};
+
+std::vector<ConsensusFeature> WhatDependsOn(ConsensusFeature f);
 
 typedef boost::variant<libzcash::SaplingPaymentAddress, CScript> FundingStreamAddress;
 
@@ -166,6 +198,8 @@ struct Params {
 
     bool FutureTimestampSoftForkActive(int nHeight) const;
 
+    bool FeatureActive(int nHeight, Consensus::ConsensusFeature feature) const;
+
     uint256 hashGenesisBlock;
 
     bool fCoinbaseMustBeShielded;
@@ -216,6 +250,13 @@ struct Params {
         int startHeight,
         int endHeight,
         const std::vector<std::string>& addresses);
+
+    /**
+     * A set of features that have been explicitly force-enabled
+     * via the CLI, overriding block-height based decisions for
+     * this feature.
+     */
+    std::set<ConsensusFeature> vRequiredFeatures;
 
     /**
      * Default block height at which the future timestamp soft fork rule activates.
