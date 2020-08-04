@@ -8,7 +8,16 @@
   #include <stdalign.h>
 #endif
 
-#define ENTRY_SERIALIZED_LENGTH 180
+#define NODE_SERIALIZED_LENGTH 171
+#define ENTRY_SERIALIZED_LENGTH (NODE_SERIALIZED_LENGTH + 9)
+
+typedef struct HistoryNode {
+    unsigned char bytes[NODE_SERIALIZED_LENGTH];
+}  HistoryNode;
+static_assert(
+    sizeof(HistoryNode) == NODE_SERIALIZED_LENGTH,
+    "HistoryNode struct is not the same size as the underlying byte array");
+static_assert(alignof(HistoryNode) == 1, "HistoryNode struct alignment is not 1");
 
 typedef struct HistoryEntry {
     unsigned char bytes[ENTRY_SERIALIZED_LENGTH];
@@ -331,9 +340,9 @@ extern "C" {
         const uint32_t *ni_ptr,
         const HistoryEntry *n_ptr,
         size_t p_len,
-        const unsigned char *nn_ptr,
+        const HistoryNode *nn_ptr,
         unsigned char *rt_ret,
-        unsigned char *buf_ret
+        HistoryNode *buf_ret
     );
 
     uint32_t librustzcash_mmr_delete(
@@ -348,14 +357,14 @@ extern "C" {
 
     uint32_t librustzcash_mmr_hash_node(
         uint32_t cbranch,
-        const unsigned char *n_ptr,
+        const HistoryNode *n_ptr,
         unsigned char *h_ret
     );
 
     bool librustzcash_tze_verify(
         uint32_t cbranch,
         uint32_t p_extension_id, // TODO: maybe this should use uint32_t all the way through
-        uint32_t p_mode, 
+        uint32_t p_mode,
         const unsigned char* p_payload,
         size_t p_size,
         uint32_t w_extension_id,
@@ -366,6 +375,13 @@ extern "C" {
         const unsigned char* tx,
         size_t tx_size
         // TODO: some return channel for errors?
+    );
+
+    int librustzcash_zebra_crypto_sign_verify_detached(
+        const unsigned char *sig,
+        const unsigned char *m,
+        unsigned long long mlen,
+        const unsigned char *pk
     );
 #ifdef __cplusplus
 }

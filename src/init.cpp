@@ -65,10 +65,6 @@
 #include "zmq/zmqnotificationinterface.h"
 #endif
 
-#if ENABLE_PROTON
-#include "amqp/amqpnotificationinterface.h"
-#endif
-
 #include "librustzcash.h"
 
 using namespace std;
@@ -86,10 +82,6 @@ static const bool DEFAULT_STOPAFTERBLOCKIMPORT = false;
 
 #if ENABLE_ZMQ
 static CZMQNotificationInterface* pzmqNotificationInterface = NULL;
-#endif
-
-#if ENABLE_PROTON
-static AMQPNotificationInterface* pAMQPNotificationInterface = NULL;
 #endif
 
 #ifdef WIN32
@@ -229,6 +221,9 @@ void Shutdown()
         if (pcoinsTip != NULL) {
             FlushStateToDisk();
         }
+        // Flush the wallet witness cache to disk (no longer done by FlushStateToDisk())
+        GetMainSignals().SetBestChain(chainActive.GetLocator());
+
         delete pcoinsTip;
         pcoinsTip = NULL;
         delete pcoinscatcher;
@@ -248,14 +243,6 @@ void Shutdown()
         UnregisterValidationInterface(pzmqNotificationInterface);
         delete pzmqNotificationInterface;
         pzmqNotificationInterface = NULL;
-    }
-#endif
-
-#if ENABLE_PROTON
-    if (pAMQPNotificationInterface) {
-        UnregisterValidationInterface(pAMQPNotificationInterface);
-        delete pAMQPNotificationInterface;
-        pAMQPNotificationInterface = NULL;
     }
 #endif
 
@@ -420,14 +407,6 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-zmqpubrawtx=<address>", _("Enable publish raw transaction in <address>"));
 #endif
 
-#if ENABLE_PROTON
-    strUsage += HelpMessageGroup(_("AMQP 1.0 notification options:"));
-    strUsage += HelpMessageOpt("-amqppubhashblock=<address>", _("Enable publish hash block in <address>"));
-    strUsage += HelpMessageOpt("-amqppubhashtx=<address>", _("Enable publish hash transaction in <address>"));
-    strUsage += HelpMessageOpt("-amqppubrawblock=<address>", _("Enable publish raw block in <address>"));
-    strUsage += HelpMessageOpt("-amqppubrawtx=<address>", _("Enable publish raw transaction in <address>"));
-#endif
-
     strUsage += HelpMessageGroup(_("Debugging/Testing options:"));
     if (showDebug)
     {
@@ -439,6 +418,9 @@ std::string HelpMessage(HelpMessageMode mode)
         strUsage += HelpMessageOpt("-stopafterblockimport", strprintf("Stop running after importing blocks from disk (default: %u)", DEFAULT_STOPAFTERBLOCKIMPORT));
         strUsage += HelpMessageOpt("-nuparams=hexBranchId:activationHeight", "Use given activation height for specified network upgrade (regtest-only)");
         strUsage += HelpMessageOpt("-nurejectoldversions", strprintf("Reject peers that don't know about the current epoch (regtest-only) (default: %u)", DEFAULT_NU_REJECT_OLD_VERSIONS));
+        strUsage += HelpMessageOpt(
+                "-fundingstream=streamId:startHeight:endHeight:comma_delimited_addresses", 
+                "Use given addresses for block subsidy share paid to the funding stream with id <streamId> (regtest-only)");
     }
     string debugCategories = "addrman, alert, bench, coindb, db, estimatefee, http, libevent, lock, mempool, net, partitioncheck, pow, proxy, prune, "
                              "rand, reindex, rpc, selectcoins, tor, zmq, zrpc, zrpcunsafe (implies zrpc)"; // Don't translate these
@@ -1036,12 +1018,13 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 
     nMaxTipAge = GetArg("-maxtipage", DEFAULT_MAX_TIP_AGE);
 
+    KeyIO keyIO(chainparams);
 #ifdef ENABLE_MINING
     if (mapArgs.count("-mineraddress")) {
-        CTxDestination addr = DecodeDestination(mapArgs["-mineraddress"]);
+        CTxDestination addr = keyIO.DecodeDestination(mapArgs["-mineraddress"]);
         if (!IsValidDestination(addr)) {
             // Try a Sapling address
-            auto zaddr = DecodePaymentAddress(mapArgs["-mineraddress"]);
+            auto zaddr = keyIO.DecodePaymentAddress(mapArgs["-mineraddress"]);
             if (!IsValidPaymentAddress(zaddr) ||
                 boost::get<libzcash::SaplingPaymentAddress>(&zaddr) == nullptr)
             {
@@ -1089,6 +1072,45 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     if (mapArgs.count("-nurejectoldversions")) {
         if (Params().NetworkIDString() != "regtest") {
             return InitError("-nurejectoldversions may only be set on regtest.");
+        }
+    }
+
+    if (!mapMultiArgs["-fundingstream"].empty()) {
+        // Allow overriding network upgrade parameters for testing
+        if (Params().NetworkIDString() != "regtest") {
+            return InitError("Funding stream parameters may only be overridden on regtest.");
+        }
+        const std::vector<std::string>& streams = mapMultiArgs["-fundingstream"];
+        for (auto i : streams) {
+            std::vector<std::string> vStreamParams;
+            boost::split(vStreamParams, i, boost::is_any_of(":"));
+            if (vStreamParams.size() != 4) {
+                return InitError("Funding stream parameters malformed, expecting streamId:startHeight:endHeight:comma_delimited_addresses");
+            }
+            int nFundingStreamId;
+            if (!ParseInt32(vStreamParams[0], &nFundingStreamId) || 
+                    nFundingStreamId < Consensus::FIRST_FUNDING_STREAM || 
+                    nFundingStreamId >= Consensus::MAX_FUNDING_STREAMS) {
+                return InitError(strprintf("Invalid streamId (%s)", vStreamParams[0]));
+            }
+
+            int nStartHeight;
+            if (!ParseInt32(vStreamParams[1], &nStartHeight)) {
+                return InitError(strprintf("Invalid funding stream start height (%s)", vStreamParams[1]));
+            }
+
+            int nEndHeight;
+            if (!ParseInt32(vStreamParams[2], &nEndHeight)) {
+                return InitError(strprintf("Invalid funding stream end height (%s)", vStreamParams[2]));
+            }
+
+            std::vector<std::string> vStreamAddrs;
+            boost::split(vStreamAddrs, vStreamParams[3], boost::is_any_of(","));
+
+            auto fs = Consensus::FundingStream::ParseFundingStream(
+                    Params().GetConsensus(), Params(), nStartHeight, nEndHeight, vStreamAddrs);
+
+            UpdateFundingStreamParameters((Consensus::FundingStreamIndex) nFundingStreamId, fs);
         }
     }
 
@@ -1319,21 +1341,6 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 #endif
 
-#if ENABLE_PROTON
-    pAMQPNotificationInterface = AMQPNotificationInterface::CreateWithArguments(mapArgs);
-
-    if (pAMQPNotificationInterface) {
-
-        // AMQP support is currently an experimental feature, so fail if user configured AMQP notifications
-        // without enabling experimental features.
-        if (!GetBoolArg("-experimentalfeatures", false)) {
-            return InitError(_("AMQP support requires -experimentalfeatures."));
-        }
-
-        RegisterValidationInterface(pAMQPNotificationInterface);
-    }
-#endif
-
     // ********************************************************* Step 7: load block chain
 
     fReindex = GetBoolArg("-reindex", false);
@@ -1545,12 +1552,12 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
  #ifdef ENABLE_WALLET
         bool minerAddressInLocalWallet = false;
         if (pwalletMain) {
-            CTxDestination addr = DecodeDestination(mapArgs["-mineraddress"]);
+            CTxDestination addr = keyIO.DecodeDestination(mapArgs["-mineraddress"]);
             if (IsValidDestination(addr)) {
                 CKeyID keyID = boost::get<CKeyID>(addr);
                 minerAddressInLocalWallet = pwalletMain->HaveKey(keyID);
             } else {
-                auto zaddr = DecodePaymentAddress(mapArgs["-mineraddress"]);
+                auto zaddr = keyIO.DecodePaymentAddress(mapArgs["-mineraddress"]);
                 minerAddressInLocalWallet = boost::apply_visitor(
                     HaveSpendingKeyForPaymentAddress(pwalletMain), zaddr);
             }

@@ -46,9 +46,6 @@ LIBZCASH=libzcash.a
 if ENABLE_ZMQ
 LIBBITCOIN_ZMQ=libbitcoin_zmq.a
 endif
-if ENABLE_PROTON
-LIBBITCOIN_PROTON=libbitcoin_proton.a
-endif
 if BUILD_BITCOIN_LIBS
 LIBZCASH_CONSENSUS=libzcashconsensus.la
 endif
@@ -115,7 +112,6 @@ EXTRA_LIBRARIES += \
   $(LIBBITCOIN_CLI) \
   $(LIBBITCOIN_WALLET) \
   $(LIBBITCOIN_ZMQ) \
-  $(LIBBITCOIN_PROTON) \
   $(LIBZCASH)
 
 lib_LTLIBRARIES = $(LIBZCASH_CONSENSUS)
@@ -155,11 +151,6 @@ BITCOIN_CORE_H = \
   addrman.h \
   alert.h \
   amount.h \
-  amqp/amqpabstractnotifier.h \
-  amqp/amqpconfig.h \
-  amqp/amqpnotificationinterface.h \
-  amqp/amqppublishnotifier.h \
-  amqp/amqpsender.h \
   arith_uint256.h \
   asyncrpcoperation.h \
   asyncrpcqueue.h \
@@ -181,6 +172,7 @@ BITCOIN_CORE_H = \
   compat/sanity.h \
   compressor.h \
   consensus/consensus.h \
+  consensus/funding.h \
   consensus/params.h \
   consensus/upgrades.h \
   consensus/validation.h \
@@ -193,6 +185,7 @@ BITCOIN_CORE_H = \
   httpserver.h \
   init.h \
   key.h \
+  key_constants.h \
   key_io.h \
   keystore.h \
   dbwrapper.h \
@@ -337,15 +330,6 @@ libbitcoin_zmq_a_SOURCES = \
   zmq/zmqpublishnotifier.cpp
 endif
 
-if ENABLE_PROTON
-libbitcoin_proton_a_CPPFLAGS = $(BITCOIN_INCLUDES)
-libbitcoin_proton_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
-libbitcoin_proton_a_SOURCES = \
-  amqp/amqpabstractnotifier.cpp \
-  amqp/amqpnotificationinterface.cpp \
-  amqp/amqppublishnotifier.cpp
-endif
-
 # wallet: zcashd, but only linked when wallet enabled
 libbitcoin_wallet_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
 libbitcoin_wallet_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
@@ -373,6 +357,8 @@ libbitcoin_wallet_a_SOURCES = \
 crypto_libbitcoin_crypto_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_CONFIG_INCLUDES)
 crypto_libbitcoin_crypto_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 crypto_libbitcoin_crypto_a_SOURCES = \
+  crypto/aes.cpp \
+  crypto/aes.h \
   crypto/common.h \
   crypto/equihash.cpp \
   crypto/equihash.h \
@@ -413,6 +399,7 @@ libbitcoin_common_a_SOURCES = \
   chainparams.cpp \
   coins.cpp \
   compressor.cpp \
+  consensus/funding.cpp \
   consensus/params.cpp \
   consensus/upgrades.cpp \
   core_read.cpp \
@@ -494,7 +481,6 @@ zcashd_LDADD = \
   $(LIBUNIVALUE) \
   $(LIBBITCOIN_UTIL) \
   $(LIBBITCOIN_ZMQ) \
-  $(LIBBITCOIN_PROTON) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBZCASH) \
   $(LIBRUSTZCASH) \
@@ -510,7 +496,6 @@ zcashd_LDADD += \
   $(EVENT_PTHREADS_LIBS) \
   $(EVENT_LIBS) \
   $(ZMQ_LIBS) \
-  $(PROTON_LIBS) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBZCASH_LIBS)
 
@@ -612,11 +597,17 @@ libzcashconsensus_la_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 endif
 #
 
+CTAES_DIST =  crypto/ctaes/bench.c
+CTAES_DIST += crypto/ctaes/ctaes.c
+CTAES_DIST += crypto/ctaes/ctaes.h
+CTAES_DIST += crypto/ctaes/README.md
+CTAES_DIST += crypto/ctaes/test.c
+
 CLEANFILES = leveldb/libleveldb.a leveldb/libmemenv.a *.gcda *.gcno */*.gcno wallet/*/*.gcno
 
 DISTCLEANFILES = obj/build.h
 
-EXTRA_DIST = leveldb rust
+EXTRA_DIST = leveldb $(CTAES_DIST) rust
 
 clean-local:
 	rm -f $(top_srcdir)/.cargo/config $(top_srcdir)/.cargo/.configured-for-*
